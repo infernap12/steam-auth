@@ -26,6 +26,14 @@ struct Args {
     )]
     url: Option<String>,
 
+    #[arg(
+        long,
+        short = 's',
+        required = true,
+        help = "Service identity to embed in ticket"
+    )]
+    service_identity: String,
+
     /// Email address to send with the authentication ticket
     ///
     /// Required when using --url. The email will be sent as a query parameter
@@ -88,7 +96,7 @@ async fn main() {
 
     // Register callback for ticket response
     let _cb = client.register_callback(move |response: TicketForWebApiResponse| {
-        println!("Got ticket response: {:?}", response);
+        println!("Got ticket response");
 
         match response.result {
             Ok(()) => {
@@ -111,7 +119,7 @@ async fn main() {
     println!("Steam ID: {}", user.steam_id().raw());
 
     // Request auth ticket for web API
-    let auth_ticket_handle = user.authentication_session_ticket_for_webapi("BitCraftApiServer");
+    let auth_ticket_handle = user.authentication_session_ticket_for_webapi(&args.service_identity);
     println!("Auth ticket handle: {:?}", auth_ticket_handle);
     println!("Waiting for ticket response...");
 

@@ -20,7 +20,7 @@ struct Args {
     #[arg(
         long,
         short = 'u',
-        group = "post_mode",
+        group = "action",
         requires = "email",
         help = "URL to POST authentication ticket to"
     )]
@@ -41,7 +41,6 @@ struct Args {
     #[arg(
         long,
         short = 'e',
-        group = "post_mode",
         requires = "url",
         help = "Email to send with auth ticket"
     )]
@@ -56,7 +55,7 @@ struct Args {
         long,
         short = 'o',
         default_value = "auth_ticket.txt",
-        conflicts_with = "post_mode",
+        group = "action",
         help = "Output file for auth ticket"
     )]
     output_file: String,
@@ -68,7 +67,7 @@ struct Args {
     #[arg(
         long,
         short = 'x',
-        conflicts_with = "post_mode",
+        requires = "output_file",
         help = "Exit immediately after writing ticket file"
     )]
     exit: bool,

@@ -9,7 +9,14 @@ keywords = ["steam", "authentication", "gaming", "api"]
 categories = ["authentication", "api-bindings"]
 
 [dependencies]
-steamworks = "0.12.2"
 clap = { version = "4.4", features = ["derive"] }
 reqwest = { version = "0.12.23", features = ["json"] }
 tokio = { version = "1.0", features = ["full"] }
+steam-vent = "0.3.1"
+steam-vent-proto = "0.5.0"
+futures-util = "0.3.31"
+base64 = "0.22.1"
+tracing-subscriber = "0.3.20"
+rand = "0.9.2"
+byteorder = "1.5.0"
+crc32fast = "1.5.0"

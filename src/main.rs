@@ -1,10 +1,22 @@
-use clap::Parser;
-use reqwest;
-use std::fs::File;
-use std::io::{stdin, Write};
-use std::sync::{Arc, Mutex};
-use steamworks::{Client, TicketForWebApiResponse};
+mod steam_auth_rust;
 
+use base64::Engine;
+use clap::Parser;
+use futures_util::StreamExt;
+use reqwest;
+use std::error::Error;
+use std::fs::File;
+use std::io::{stdin, Read, Write};
+use steam_vent::auth::{AuthConfirmationHandler, ConsoleAuthConfirmationHandler, DeviceConfirmationHandler, FileGuardDataStore, GuardDataStore};
+use steam_vent::{Connection, ConnectionTrait, ServerList};
+use steam_vent_proto::steammessages_clientserver::{CMsgClientGameConnectTokens, CMsgClientGamesPlayed, CMsgClientGetAppOwnershipTicket, CMsgClientGetAppOwnershipTicketResponse};
+use tokio::io::AsyncWriteExt;
+
+use crate::steam_auth_rust::SteamAuthTicket;
+use byteorder::WriteBytesExt;
+use rand::RngCore;
+use steam_vent_proto::enums_clientserver::EMsg;
+use steam_vent_proto::steammessages_clientserver::cmsg_client_games_played::GamePlayed;
 
 #[derive(Parser)]
 #[command(name = "steam-auth")]
@@ -13,6 +25,33 @@ use steamworks::{Client, TicketForWebApiResponse};
     long_about = "Generates Steam authentication tickets for web API usage. Can either POST the ticket to a URL with email credentials or save it to a local file."
 )]
 struct Args {
+    /// Steam account username
+    #[arg(
+        long,
+        short = 'a',
+        required = true,
+        help = "Steam account username"
+    )]
+    account: String,
+
+    /// Steam account password
+    #[arg(
+        long,
+        short = 'p',
+        required = true,
+        help = "Steam account password"
+    )]
+    password: String,
+
+    /// Service identity to embed in ticket
+    #[arg(
+        long,
+        short = 's',
+        required = true,
+        help = "Service identity to embed in ticket"
+    )]
+    service_identity: String,
+
     /// URL endpoint to POST the authentication ticket to
     ///
     /// When provided, must be used together with `--email`. The ticket will be sent
@@ -25,14 +64,6 @@ struct Args {
         help = "URL to POST authentication ticket to"
     )]
     url: Option<String>,
-
-    #[arg(
-        long,
-        short = 's',
-        required = true,
-        help = "Service identity to embed in ticket"
-    )]
-    service_identity: String,
 
     /// Email address to send with the authentication ticket
     ///
@@ -74,110 +105,127 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt::init();
+
     let args = Args::parse();
 
+    // Initialize guard data and connection
+    let guard_data = FileGuardDataStore::user_cache();
 
-    // Initialize Steam client
-    let client = match Client::init() {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("Failed to initialize Steam client: {:?}", e);
-            return;
-        }
+
+    println!("Connecting to Steam...");
+
+    let handler = ConsoleAuthConfirmationHandler::default().or(DeviceConfirmationHandler);
+    let server_list = ServerList::discover().await?;
+
+    let connection = Connection::login(
+        &server_list,
+        &args.account,
+        &args.password,
+        guard_data,
+        handler,
+    ).await?;
+
+
+    println!("Successfully connected to Steam!");
+
+
+
+
+
+    // Set up token message handler
+    // let mut tokens_messages = connection.on::<CMsgClientGameConnectTokens>();
+
+    // Read app ID from file
+    let app_id = std::fs::read_to_string("steam_appid.txt")
+        .map_err(|e| format!("Failed to read steam_appid.txt: {}", e))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("Invalid app ID in steam_appid.txt: {}", e))?;
+
+    println!("Using app ID: {}", app_id);
+
+    // let gc = GameCoordinator::new(&connection, app_id).await?;
+
+    // Get app ownership ticket
+    let msg = CMsgClientGetAppOwnershipTicket {
+        app_id: Some(app_id),
+        ..Default::default()
     };
 
-    println!("Steam client initialized successfully!");
+    let response: CMsgClientGetAppOwnershipTicketResponse = connection.job(msg).await?;
+    dbg!(response.ticket);
 
-    // Shared state to store the ticket when callback fires
-    let ticket_data = Arc::new(Mutex::new(None::<Vec<u8>>));
-    let ticket_data_clone = ticket_data.clone();
+    let games_msg = CMsgClientGamesPlayed {
+        games_played: vec![GamePlayed {
+            game_id: Some(app_id as u64), // CS:GO for testing
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    connection.send_with_kind(games_msg, EMsg::k_EMsgClientGamesPlayed).await?;
 
-    // Register callback for ticket response
-    let _cb = client.register_callback(move |response: TicketForWebApiResponse| {
-        println!("Got ticket response");
+    let mut tokens_messages = connection.on::<CMsgClientGameConnectTokens>();
+    // Initialize auth handler and process game connect tokens
+    let mut auth_handler = SteamAuthTicket::new();
+    if let Some(Ok(tokens_message)) = tokens_messages.next().await {
+        println!("Received {} game connect tokens", tokens_message.tokens.len());
+        auth_handler.handle_game_connect_tokens(
+            tokens_message.tokens.clone(),
+            tokens_message.max_tokens_to_keep()
+        );
+    }
 
-        match response.result {
-            Ok(()) => {
-                println!("Ticket generated successfully, {} bytes", response.ticket.len());
-                *ticket_data_clone.lock().unwrap() = Some(response.ticket.clone());
+    println!("Generating web API authentication ticket...");
+
+    // Generate the web API ticket using the service identity from args
+    let ticket = auth_handler
+        .get_auth_ticket_for_web_api(&connection, app_id, args.service_identity.clone())
+        .await?;
+
+    println!("Successfully generated authentication ticket ({} bytes)", ticket.token.len());
+
+    // Handle the ticket based on command line arguments
+    if let (Some(url), Some(email)) = (&args.url, &args.email) {
+        // POST to URL
+        println!("Posting authentication ticket to: {}", url);
+        match post_ticket_to_url(url, email, &ticket.token).await {
+            Ok(_) => {
+                println!("Successfully authenticated with server!");
+                return Ok(());
             }
             Err(e) => {
-                eprintln!("Failed to generate ticket: {:?}", e);
+                eprintln!("Error posting ticket to URL: {}", e);
+                return Err(e);
             }
         }
-    });
-
-    // Get user and check login status
-    let user = client.user();
-    if !user.logged_on() {
-        eprintln!("User is not logged into Steam");
-        return;
-    }
-
-    println!("Steam ID: {}", user.steam_id().raw());
-
-    // Request auth ticket for web API
-    let auth_ticket_handle = user.authentication_session_ticket_for_webapi(&args.service_identity);
-    println!("Auth ticket handle: {:?}", auth_ticket_handle);
-    println!("Waiting for ticket response...");
-
-    // Wait for callback to receive actual ticket data
-    let mut ticket_received = false;
-    let mut attempts = 0;
-    while !ticket_received && attempts < 100 {
-        client.run_callbacks();
-
-        if let Some(ticket) = ticket_data.lock().unwrap().as_ref() {
-            println!("Received ticket with {} bytes", ticket.len());
-
-            // Either POST to URL or write to file
-            if let (Some(url), Some(email)) = (&args.url, &args.email) {
-                println!("Attempting to post ticket to URL: {} with email: {}", url, email);
-                match post_ticket_to_url(url, email, ticket).await {
-                    Ok(_) => {
-                        println!("Successfully authenticated!");
-                        std::process::exit(0);
-                    } // Succeed silently on 200 OK
-                    Err(e) => {
-                        eprintln!("Error posting ticket: {}", e);
-                        panic!("Failed to post auth ticket");
-                    }
-                }
-            } else {
-                match write_ticket_to_file(ticket, &args.output_file) {
-                    Ok(_) => println!("Ticket written to {}", args.output_file),
-                    Err(e) => eprintln!("Failed to write ticket to file: {:?}", e),
-                }
+    } else {
+        // Write to file
+        println!("Writing authentication ticket to: {}", args.output_file);
+        match write_ticket_to_file(&ticket.token, &args.output_file) {
+            Ok(_) => {
+                println!("Ticket written to {}", args.output_file);
             }
-            ticket_received = true;
+            Err(e) => {
+                eprintln!("Failed to write ticket to file: {}", e);
+                return Err(e);
+            }
+        }
+
+        // Exit immediately if requested, otherwise wait for user input
+        if args.exit {
+            println!("Exiting immediately as requested.");
+            return Ok(());
         } else {
-            attempts += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            println!("Authentication ticket generated. Press Enter to exit...");
+            let mut input = String::new();
+            stdin().read_line(&mut input)?;
         }
     }
 
-    if !ticket_received {
-        eprintln!("Timeout waiting for ticket response");
-    }
-
-    // Keep Steam client alive until Enter is pressed
-    println!("Session held open. Press Enter to exit...");
-
-    std::thread::spawn(|| {
-        let mut input = String::new();
-        stdin().read_line(&mut input).unwrap();
-        std::process::exit(0);
-    });
-
-    // Keep running callbacks forever until user presses Enter
-    // this is to allow user to post the ticket manually
-    loop {
-        client.run_callbacks();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    Ok(())
 }
-
 
 async fn post_ticket_to_url(url: &str, email: &str, ticket: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let hex_ticket = ticket.iter()
